@@ -3,11 +3,14 @@ const axios   = require('axios');
 const cheerio = require('cheerio');
 const cors    = require('cors');
 const path    = require('path');
+const fs      = require('fs');
+
+const CACHE_FILE = path.join(__dirname, 'data', 'events-cache.json');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(__dirname));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ─────────────────────────────────────────────
 //  HTTP helpers
@@ -316,7 +319,7 @@ function cityFromEvent(event) {
   if (m) {
     const parts = m[1].split(/hyrox/i);
     const afterHyrox = parts[parts.length - 1]
-      .replace(/\d{2}\/\d{2}/, '')   // strip season "25/26" (purely numeric)
+      .replace(/\d{2}\/\d{2}/, '')   // strip season pattern e.g. "25/26"
       .replace(/\s*-\s*/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
@@ -422,7 +425,7 @@ function detectContinent(coords) {
 
   if (lat > 35 && lat < 72 && lng > -25 && lng < 45)   return 'europe';
   if (lat > 15 && lat < 72 && lng > -170 && lng < -50)  return 'americas';
-  if (lat > -60 && lat < 15 && lng > -82  && lng < -34)  return 'americas';  // South America
+  if (lat > -60 && lat < 15 && lng > -82  && lng < -34)  return 'americas';  // Central & South America
   if (lat > 15 && lat < 42 && lng > 25   && lng < 65)   return 'middle east';
   if (lat > -10 && lat < 55 && lng > 60  && lng < 150)  return 'asia-pacific';
   if (lat > -50 && lat < -10 && lng > 110 && lng < 180) return 'asia-pacific'; // AU/NZ
@@ -432,17 +435,57 @@ function detectContinent(coords) {
 }
 
 // ─────────────────────────────────────────────
+//  DISK CACHE HELPERS
+// ─────────────────────────────────────────────
+function loadDiskCache() {
+  try {
+    const raw = fs.readFileSync(CACHE_FILE, 'utf8');
+    const { events, timestamp } = JSON.parse(raw);
+    if (Array.isArray(events) && timestamp) {
+      cachedEvents = events;
+      cacheTime    = timestamp;
+      console.log(`[CACHE] Loaded ${events.length} events from disk (${new Date(timestamp).toISOString()})`);
+    }
+  } catch { /* no cache file yet */ }
+}
+
+function saveDiskCache(events) {
+  try {
+    fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ events, timestamp: cacheTime }));
+  } catch (e) {
+    console.error('[CACHE] Failed to write disk cache:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
 //  MAIN PIPELINE
 // ─────────────────────────────────────────────
 let cachedEvents = null;
 let cacheTime    = 0;
-const CACHE_TTL  = 60 * 60 * 1000; // 1 hour
+let isRefreshing = false;
+const CACHE_TTL  = 6 * 60 * 60 * 1000; // 6 hours
 
 async function loadEvents(force = false) {
+  // Fresh cache → instant return
   if (!force && cachedEvents && Date.now() - cacheTime < CACHE_TTL) {
     return cachedEvents;
   }
 
+  // Stale cache → return stale immediately, kick off refresh if not already running
+  if (!force && cachedEvents) {
+    if (!isRefreshing) {
+      isRefreshing = true;
+      scrapeEvents().finally(() => { isRefreshing = false; });
+    }
+    return cachedEvents;
+  }
+
+  // No cache (first run) or forced → must wait
+  return scrapeEvents();
+}
+
+async function scrapeEvents() {
   console.log('\n[PIPELINE] Starting event scrape...');
   let events = [];
 
@@ -499,6 +542,7 @@ async function loadEvents(force = false) {
 
   cachedEvents = events;
   cacheTime    = Date.now();
+  saveDiskCache(events);
   return events;
 }
 
@@ -534,19 +578,20 @@ app.post('/api/events/refresh', async (_req, res) => {
   }
 });
 
-app.get('/', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
-
 // ─────────────────────────────────────────────
 //  START
 // ─────────────────────────────────────────────
+// Load disk cache synchronously before accepting requests
+loadDiskCache();
+
 const PORT = 3000;
 app.listen(PORT, () => {
   console.log(`\n  HYROX Map Server`);
   console.log(`  http://localhost:${PORT}`);
   console.log(`  API: http://localhost:${PORT}/api/events\n`);
 
-  // Pre-fetch events in background so first API call is fast
-  loadEvents().catch((e) => console.error('[PREFETCH] Error:', e.message));
+  // Refresh in background if cache is stale or missing
+  if (!cachedEvents || Date.now() - cacheTime >= CACHE_TTL) {
+    loadEvents().catch((e) => console.error('[PREFETCH] Error:', e.message));
+  }
 });
